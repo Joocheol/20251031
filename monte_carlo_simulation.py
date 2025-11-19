@@ -8,13 +8,14 @@ model calibrated from historical log returns.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean, pstdev
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,92 @@ def simulate_paths(
     return paths_data
 
 
+ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.Call,
+    ast.Name,
+    ast.Load,
+    ast.Constant,
+    ast.Subscript,
+    ast.Slice,
+    ast.Tuple,
+    ast.List,
+    ast.Dict,
+    ast.Set,
+    ast.IfExp,
+    ast.keyword,
+    ast.Attribute,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Pow,
+    ast.Mod,
+    ast.FloorDiv,
+    ast.USub,
+    ast.UAdd,
+    ast.And,
+    ast.Or,
+    ast.Not,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+)
+
+
+SAFE_GLOBALS = {
+    "__builtins__": {},
+    "max": max,
+    "min": min,
+    "abs": abs,
+    "sum": sum,
+    "len": len,
+    "math": math,
+}
+
+
+def validate_payoff_ast(node: ast.AST) -> None:
+    if not isinstance(node, ALLOWED_AST_NODES):
+        raise ValueError(
+            "Unsupported expression in payoff. Allowed operators are limited to"
+            " arithmetic, comparisons, boolean logic, and math functions."
+        )
+
+    if isinstance(node, ast.Attribute):
+        if not (isinstance(node.value, ast.Name) and node.value.id == "math"):
+            raise ValueError("Only attributes of 'math' are allowed in payoff expressions")
+
+    if isinstance(node, ast.Name):
+        if node.id not in {"S_T", "S0", "path", "math", "max", "min", "abs", "sum", "len"}:
+            raise ValueError(f"Unknown identifier '{node.id}' in payoff expression")
+
+    for child in ast.iter_child_nodes(node):
+        validate_payoff_ast(child)
+
+
+def build_payoff_function(expression: str) -> Callable[[Sequence[float]], float]:
+    if not expression or not expression.strip():
+        raise ValueError("Payoff expression must be a non-empty string")
+
+    tree = ast.parse(expression, mode="eval")
+    validate_payoff_ast(tree)
+    code = compile(tree, "<payoff>", "eval")
+
+    def payoff(path: Sequence[float]) -> float:
+        local_env = {"S_T": path[-1], "S0": path[0], "path": path}
+        value = eval(code, SAFE_GLOBALS, local_env)
+        return float(value)
+
+    return payoff
+
+
 def summarize_paths(paths: Sequence[Sequence[float]]) -> Dict[str, float]:
     final_prices = [path[-1] for path in paths]
     sorted_final = sorted(final_prices)
@@ -142,6 +229,17 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=252, help="Number of future trading days to simulate")
     parser.add_argument("--paths", type=int, default=1000, help="Number of Monte Carlo paths")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible runs")
+    parser.add_argument(
+        "--payoff",
+        required=True,
+        help="Payoff expression using variables S_T (final price), S0 (start price), and path",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        help="Continuously compounded annual risk-free rate for discounting (e.g., 0.03)",
+    )
     args = parser.parse_args()
 
     series = load_price_series(args.csv, args.ticker)
@@ -150,6 +248,10 @@ def main() -> None:
     volatility = pstdev(log_returns)
 
     paths = simulate_paths(series.closes[-1], drift, volatility, args.days, args.paths, args.seed)
+    payoff_fn = build_payoff_function(args.payoff)
+    payoffs = [payoff_fn(path) for path in paths]
+    discount_factor = math.exp(-args.rate * (args.days / 252.0))
+    discounted_price = discount_factor * fmean(payoffs)
     summary = summarize_paths(paths)
 
     print(f"Historical points loaded: {len(series.closes)}")
@@ -161,6 +263,12 @@ def main() -> None:
     print("Final price distribution (currency units):")
     for label in ["min", "p05", "p50", "mean", "p95", "max"]:
         print(f"  {label:>4}: {format_currency(summary[label])}")
+    print()
+    print("Option payoff summary:")
+    print(f"  Average payoff: {format_currency(fmean(payoffs))}")
+    print(
+        f"  Discounted price (rate={args.rate:.4f}): {format_currency(discounted_price)}"
+    )
     print()
     sample_path = paths[0]
     print("Sample path (first 5 days):")
